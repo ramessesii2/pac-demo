@@ -1,0 +1,107 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: release-pipeline
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[refs/tags/*]"
+    pipelinesascode.tekton.dev/task: "[.tekton/tasks/goreleaser.yaml]"
+    pipelinesascode.tekton.dev/max-keep-runs: "2"
+spec:
+  params:
+    - name: repo_url
+      value: "{{repo_url}}"
+    - name: revision
+      value: "{{revision}}"
+  pipelineSpec:
+    params:
+      - name: repo_url
+      - name: revision
+    workspaces:
+      - name: source
+    tasks:
+      - name: fetch-repository
+        taskRef:
+          kind: ClusterTask
+          name: git-clone
+        workspaces:
+          - name: output
+            workspace: source
+        params:
+          - name: depth
+            value: "0"
+          - name: url
+            value: $(params.repo_url)
+          - name: revision
+            value: $(params.revision)
+      - name: release-yaml
+        runAfter:
+          - fetch-repository
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: push-release-to-branch
+              image: registry.access.redhat.com/ubi9/python-39
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: "nightly-ci-github-hub-token"
+                      key: "hub-token"
+              script: |
+                #!/usr/bin/env bash
+                # Grab the latest tag we release in
+                # Generate release.yaml for that version, for stable and for
+                # stable version release
+                # ie:
+                # if we tag 0.5.6
+                # It will generate release yamls and upload to branch
+                # release-0.5.6, release-0.5.x and stable
+                set -eufx
+                git fetch --tag -v
+                version=$(git  --no-pager tag --points-at HEAD)
+                [[ -z ${version} ]] && {
+                    echo "No tags detected"
+                    exit
+                }
+                stable_tag=${version%.*}.x
+                for target in release-${version} release-${stable_tag} stable;do
+                  export PAC_VERSION=${version} TARGET_BRANCH=${target//release-}
+                  ./hack/generate-releaseyaml.sh > /tmp/release.k8s.yaml
+                  env TARGET_OPENSHIFT=true bash hack/generate-releaseyaml.sh > /tmp/release.yaml
+                  msg="pac release ${version} on branch ${target}"
+                  set +x
+                  echo python hack/upload-file-to-github.py --message "Release yaml generated for ${msg}" --owner-repository openshift-pipelines/pipelines-as-code --token "TOKEN" --to-ref=refs/heads/${target} --from-ref=refs/tags/${version} -f release.k8s.yaml:release.k8s.yaml -f release.yaml:release.yaml -f <(echo ${TARGET_BRANCH}):docs/content/VERSION
+                  python hack/upload-file-to-github.py --message "Release yaml generated for ${msg}" --owner-repository openshift-pipelines/pipelines-as-code --token ${HUB_TOKEN} --to-ref=refs/heads/${target} --from-ref=refs/tags/${version} -f /tmp/release.k8s.yaml:release.k8s.yaml -f /tmp/release.yaml:release.yaml -f <(echo ${TARGET_BRANCH}):docs/content/VERSION
+                  set -x
+                done
+      - name: gorelease
+        runAfter:
+          - release-yaml
+        taskRef:
+          name: goreleaser
+        params:
+          - name: package
+            value: github.com/openshift-pipelines/pipelines-as-code
+          - name: github-token-secret
+            value: "nightly-ci-github-hub-token"
+          - name: github-token-secret-key
+            value: "hub-token"
+        workspaces:
+          - name: source
+            workspace: source
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
