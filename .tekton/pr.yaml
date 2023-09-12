@@ -16,8 +16,6 @@ spec:
   pipelineSpec:
     tasks:
       - name: noop-task
-        taskRef:
-          name: hello
         taskSpec:
           steps:
             - name: noop-task
